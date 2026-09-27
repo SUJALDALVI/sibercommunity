@@ -2,19 +2,26 @@
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { ArrowLeft, Send, Hash, Users, Crown, Shield } from "lucide-react";
+import { ArrowLeft, Send, Hash, Users, Crown, Shield, Paperclip, X, Download, Image as ImageIcon, ChevronDown, ChevronRight } from "lucide-react";
 import useAuth from "@/hooks/useAuth";
 import { fetchCommunityById, fetchCommunityMembers } from "@/lib/communities";
+import { fetchCommunityPollById, voteOnPoll, type CommunityPoll } from "@/lib/trekking/polls";
+import { fetchCommunityChecklistById, toggleChecklistItem, type CommunityChecklist } from "@/lib/trekking/checklists";
 import {
   fetchMessages,
   sendMessage,
+  sendFileMessage,
   subscribeToMessages,
+  validateAttachment,
+  createSignedFileUrl,
+  MAX_ATTACHMENT_SIZE_BYTES,
   type ChatMessage,
 } from "@/lib/chat";
 import CallingProvider, { useCallingContext } from "@/components/calling/CallingProvider";
 import LiveKitCallingProvider from "@/components/calling/LiveKitCallingProvider";
 import LiveKitCallActions from "@/components/calling/LiveKitCallActions";
 import CallButton from "@/components/calling/CallButton";
+import TrekkingToolsPanel from "@/components/community/TrekkingToolsPanel";
 
 /* ── Types ────────────────────────────────────────────────────── */
 type CommunityInfo = {
@@ -91,9 +98,31 @@ export default function CommunityChatPage() {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
   const [showMembers, setShowMembers] = useState(true);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [trekkingToolsOpen, setTrekkingToolsOpen] = useState(false);
+  const [selectedTrekkingTool, setSelectedTrekkingTool] = useState<"polls" | "checklist" | "map" | null>(null);
+
+  const closeCurrentTrekkingTool = useCallback(() => {
+    setSelectedTrekkingTool(null);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedTrekkingTool) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSelectedTrekkingTool(null);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedTrekkingTool]);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const nameCache = useRef<Map<string, string>>(new Map());
 
   /* ── My display name ── */
@@ -192,22 +221,75 @@ export default function CommunityChatPage() {
   }, [messages]);
 
   /* ── Send message ── */
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = event.target.files?.[0];
+    if (!selected) return;
+
+    try {
+      validateAttachment(selected);
+      setPendingFile(selected);
+      setSendError("");
+    } catch (err: unknown) {
+      setPendingFile(null);
+      setSendError(err instanceof Error ? err.message : "Unable to attach that file.");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  useEffect(() => {
+    if (!pendingFile || !pendingFile.type.startsWith("image/")) {
+      setPreviewUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return null;
+      });
+      return;
+    }
+
+    const imageUrl = URL.createObjectURL(pendingFile);
+    setPreviewUrl((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return imageUrl;
+    });
+  }, [pendingFile]);
+
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || sending) return;
+    const hasText = text.length > 0;
+    if ((!hasText && !pendingFile) || sending) return;
+
     setSending(true);
     setSendError("");
-    setInput("");
+
     try {
-      const msg = await sendMessage(communityId, text);
-      const named: ChatMessage = { ...msg, author_name: myName };
-      setMessages((prev) =>
-        prev.some((m) => m.id === named.id) ? prev : [...prev, named]
-      );
+      if (pendingFile) {
+        const msg = await sendFileMessage(communityId, pendingFile);
+        const named: ChatMessage = { ...msg, author_name: myName };
+        setMessages((prev) =>
+          prev.some((m) => m.id === named.id) ? prev : [...prev, named]
+        );
+        setPendingFile(null);
+        setInput("");
+      } else {
+        setInput("");
+        const msg = await sendMessage(communityId, text);
+        const named: ChatMessage = { ...msg, author_name: myName };
+        setMessages((prev) =>
+          prev.some((m) => m.id === named.id) ? prev : [...prev, named]
+        );
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Failed to send.";
       setSendError(message);
-      setInput(text);
+      if (!pendingFile) {
+        setInput(text);
+      }
     } finally {
       setSending(false);
       inputRef.current?.focus();
@@ -220,6 +302,254 @@ export default function CommunityChatPage() {
       void handleSend();
     }
   };
+
+  const formatFileSize = (bytes: number | null | undefined) => {
+    if (!bytes || bytes <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+  };
+
+  function PollMessageCard({ message }: { message: ChatMessage }) {
+    const [poll, setPoll] = useState<CommunityPoll | null>(null);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+      if (!message.poll_id) {
+        setPoll(null);
+        setLoading(false);
+        return;
+      }
+
+      let active = true;
+      setLoading(true);
+      void fetchCommunityPollById(message.poll_id)
+        .then((data) => {
+          if (active) setPoll(data);
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
+
+      return () => {
+        active = false;
+      };
+    }, [message.poll_id]);
+
+    if (!poll || loading) {
+      return (
+        <div className="mt-2 max-w-md rounded-2xl border border-white/10 bg-[#111118] p-3 text-xs text-zinc-400">
+          Loading poll…
+        </div>
+      );
+    }
+
+    const totalVotes = poll.votes.length;
+    const userVote = poll.votes.find((vote) => vote.user_id === user?.id);
+    const isClosed = Boolean(poll.closed_at);
+
+    return (
+      <div className="mt-2 max-w-md rounded-2xl border border-white/10 bg-[#111118] p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <p className="text-sm font-semibold text-white">📊 {poll.question}</p>
+          {isClosed ? (
+            <span className="rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-0.5 text-[10px] uppercase tracking-[0.2em] text-amber-300">
+              Closed
+            </span>
+          ) : null}
+        </div>
+
+        <div className="space-y-2">
+          {poll.options.map((option) => {
+            const optionVotes = poll.votes.filter((vote) => vote.option_id === option.id).length;
+            const percent = totalVotes > 0 ? (optionVotes / totalVotes) * 100 : 0;
+
+            return (
+              <div key={option.id}>
+                <button
+                  type="button"
+                  disabled={isClosed || !!userVote}
+                  onClick={() => {
+                    if (isClosed || userVote) return;
+                    void voteOnPoll(poll.id, option.id).then(async () => {
+                      const refreshed = await fetchCommunityPollById(message.poll_id!);
+                      setPoll(refreshed);
+                    });
+                  }}
+                  className={`flex w-full items-center justify-between rounded-xl border px-3 py-2 text-left text-sm transition ${
+                    userVote?.option_id === option.id
+                      ? "border-red-500 bg-red-500/10 text-white"
+                      : "border-white/10 bg-[#0d0c12] text-zinc-200 hover:border-white/20"
+                  } ${isClosed || userVote ? "cursor-not-allowed opacity-80" : ""}`}
+                >
+                  <span>{option.option_text}</span>
+                  <span>{optionVotes}</span>
+                </button>
+                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-white/5">
+                  <div className="h-full rounded-full bg-red-500" style={{ width: `${percent}%` }} />
+                </div>
+                <div className="mt-0.5 text-[11px] text-zinc-500">{percent.toFixed(0)}%</div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="mt-3 text-[11px] text-zinc-400">{totalVotes} vote{totalVotes === 1 ? "" : "s"}</div>
+      </div>
+    );
+  }
+
+  function ChecklistMessageCard({ message }: { message: ChatMessage }) {
+    const [checklist, setChecklist] = useState<CommunityChecklist | null>(null);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+      if (!message.checklist_id) {
+        setChecklist(null);
+        setLoading(false);
+        return;
+      }
+
+      let active = true;
+      setLoading(true);
+      void fetchCommunityChecklistById(message.checklist_id)
+        .then((data) => {
+          if (active) setChecklist(data);
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
+
+      return () => {
+        active = false;
+      };
+    }, [message.checklist_id]);
+
+    if (!checklist || loading) {
+      return (
+        <div className="mt-2 max-w-md rounded-2xl border border-white/10 bg-[#111118] p-3 text-xs text-zinc-400">
+          Loading checklist…
+        </div>
+      );
+    }
+
+    const completed = checklist.items.filter((item) => item.completed).length;
+    const total = checklist.items.length;
+
+    return (
+      <div className="mt-2 max-w-md rounded-2xl border border-white/10 bg-[#111118] p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <p className="text-sm font-semibold text-white">☑️ {checklist.title}</p>
+          <span className="text-[11px] text-zinc-400">{completed}/{total} completed</span>
+        </div>
+
+        <div className="mb-3 h-1.5 overflow-hidden rounded-full bg-white/5">
+          <div className="h-full rounded-full bg-red-500" style={{ width: `${total > 0 ? (completed / total) * 100 : 0}%` }} />
+        </div>
+
+        <div className="space-y-2">
+          {checklist.items.map((item) => (
+            <label key={item.id} className="flex cursor-pointer items-center gap-2 rounded-xl border border-white/10 bg-[#0d0c12] px-2 py-2">
+              <input
+                type="checkbox"
+                checked={item.completed}
+                onChange={() => {
+                  void toggleChecklistItem(item.id, !item.completed).then(async () => {
+                    const refreshed = await fetchCommunityChecklistById(message.checklist_id!);
+                    setChecklist(refreshed);
+                  });
+                }}
+                className="h-4 w-4 accent-red-500"
+              />
+              <span className={`flex-1 text-sm ${item.completed ? "text-zinc-500 line-through" : "text-zinc-200"}`}>
+                {item.item_text}
+              </span>
+            </label>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function FileMessageCard({
+    message,
+    formatFileSize,
+  }: {
+    message: ChatMessage;
+    formatFileSize: (bytes: number | null | undefined) => string;
+  }) {
+    const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+    const [downloading, setDownloading] = useState(false);
+
+    useEffect(() => {
+      if (!message.storage_path) {
+        setDownloadUrl(null);
+        return;
+      }
+
+      let active = true;
+      setDownloading(true);
+      void createSignedFileUrl(message.storage_path)
+        .then((url) => {
+          if (active) setDownloadUrl(url);
+        })
+        .catch(() => {
+          if (active) setDownloadUrl(null);
+        })
+        .finally(() => {
+          if (active) setDownloading(false);
+        });
+
+      return () => {
+        active = false;
+      };
+    }, [message.storage_path]);
+
+    const isImage = (message.mime_type ?? "").startsWith("image/");
+
+    return (
+      <div className="mt-2 max-w-md rounded-xl border border-white/10 bg-white/5 p-2">
+        {isImage && downloadUrl ? (
+          <img
+            src={downloadUrl}
+            alt={message.file_name ?? "Attachment"}
+            className="max-h-64 w-full rounded-lg object-cover"
+          />
+        ) : null}
+        {!isImage ? (
+          <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-[#15141b] p-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-red-500/15 text-red-300">
+              {isImage ? <ImageIcon size={16} /> : <Paperclip size={16} />}
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-white">{message.file_name ?? "Attachment"}</p>
+              <p className="text-xs text-zinc-400">
+                {(message.mime_type || "file")}
+                {message.file_size ? ` · ${formatFileSize(message.file_size)}` : ""}
+              </p>
+            </div>
+          </div>
+        ) : null}
+        <a
+          href={downloadUrl ?? undefined}
+          target="_blank"
+          rel="noreferrer"
+          className={`mt-2 inline-flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs font-medium ${downloadUrl ? "bg-white/5 text-zinc-200 hover:bg-white/10" : "cursor-not-allowed bg-white/5 text-zinc-500"}`}
+          onClick={(e) => {
+            if (!downloadUrl) e.preventDefault();
+          }}
+        >
+          <Download size={12} />
+          {downloading ? "Preparing…" : "Download"}
+        </a>
+      </div>
+    );
+  }
 
   /* ── Group messages by date ── */
   const groups: { date: string; msgs: ChatMessage[] }[] = [];
@@ -264,6 +594,8 @@ export default function CommunityChatPage() {
     );
   }
 
+  const isTrekkingCommunity = community?.goal?.trim().toLowerCase() === "trekking";
+
   const chatContent = (
     <div className="flex h-screen overflow-hidden bg-[#09080c] text-white">
 
@@ -292,11 +624,49 @@ export default function CommunityChatPage() {
         {/* Channel */}
         <div className="px-4 py-4">
           <p className="mb-2 text-xs uppercase tracking-[0.3em] text-zinc-500">Channels</p>
-          <div className="flex items-center gap-2 rounded-xl bg-red-500/10 px-3 py-2">
+          <button
+            type="button"
+            onClick={closeCurrentTrekkingTool}
+            className="flex w-full items-center gap-2 rounded-xl bg-red-500/10 px-3 py-2 text-left transition hover:bg-red-500/15"
+          >
             <Hash size={14} className="text-red-400" />
             <span className="text-sm font-semibold text-white">general</span>
-          </div>
+          </button>
         </div>
+
+        {isTrekkingCommunity && communityId ? (
+          <div className="px-4 pb-3">
+            <button
+              type="button"
+              onClick={() => setTrekkingToolsOpen((value) => !value)}
+              className="flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left"
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-[0.25em] text-zinc-400">
+                Trekking Tools
+              </span>
+              {trekkingToolsOpen ? <ChevronDown size={14} className="text-zinc-400" /> : <ChevronRight size={14} className="text-zinc-400" />}
+            </button>
+
+            {trekkingToolsOpen ? (
+              <div className="mt-2 space-y-1.5">
+                {(["polls", "checklist", "map"] as const).map((tool) => (
+                  <button
+                    key={tool}
+                    type="button"
+                    onClick={() => setSelectedTrekkingTool(tool)}
+                    className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm transition ${
+                      selectedTrekkingTool === tool
+                        ? "bg-red-500/10 text-white ring-1 ring-red-500/30"
+                        : "bg-transparent text-zinc-300 hover:bg-white/5 hover:text-white"
+                    }`}
+                  >
+                    <span>{tool === "polls" ? "Polls" : tool === "checklist" ? "Checklist" : "Trek Map"}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
         {/* Members in sidebar */}
         <div className="mt-2 flex-1 overflow-y-auto px-4">
@@ -455,9 +825,37 @@ export default function CommunityChatPage() {
                                 </span>
                               </div>
                             ) : null}
-                            <p className="break-words text-sm leading-relaxed text-zinc-200">
-                              {msg.content}
-                            </p>
+                            {msg.message_type === "file" ? (
+                              <div className="space-y-2">
+                                <p className="break-words text-sm leading-relaxed text-zinc-200">
+                                  {msg.content}
+                                </p>
+                                {msg.storage_path ? (
+                                  <FileMessageCard
+                                    message={msg}
+                                    formatFileSize={formatFileSize}
+                                  />
+                                ) : null}
+                              </div>
+                            ) : msg.message_type === "poll" ? (
+                              <div className="space-y-2">
+                                <p className="break-words text-sm leading-relaxed text-zinc-200">
+                                  {msg.content}
+                                </p>
+                                <PollMessageCard message={msg} />
+                              </div>
+                            ) : msg.message_type === "checklist" ? (
+                              <div className="space-y-2">
+                                <p className="break-words text-sm leading-relaxed text-zinc-200">
+                                  {msg.content}
+                                </p>
+                                <ChecklistMessageCard message={msg} />
+                              </div>
+                            ) : (
+                              <p className="break-words text-sm leading-relaxed text-zinc-200">
+                                {msg.content}
+                              </p>
+                            )}
                           </div>
                         </div>
                       );
@@ -473,13 +871,54 @@ export default function CommunityChatPage() {
               {sendError ? (
                 <p className="mb-2 text-xs text-red-400">{sendError}</p>
               ) : null}
+              {pendingFile ? (
+                <div className="mb-3 flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-[#111118] px-3 py-2">
+                  <div className="flex min-w-0 items-center gap-3">
+                    {previewUrl ? (
+                      <img src={previewUrl} alt="Pending upload preview" className="h-10 w-10 rounded object-cover" />
+                    ) : (
+                      <div className="flex h-10 w-10 items-center justify-center rounded bg-white/5 text-zinc-300">
+                        <Paperclip size={15} />
+                      </div>
+                    )}
+                    <div className="min-w-0">
+                      <p className="truncate text-sm text-white">{pendingFile.name}</p>
+                      <p className="text-xs text-zinc-400">{formatFileSize(pendingFile.size)} · {pendingFile.type || "file"}</p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPendingFile(null)}
+                    className="flex h-8 w-8 items-center justify-center rounded-xl bg-white/5 text-zinc-300 hover:bg-white/10"
+                    aria-label="Remove selected file"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              ) : null}
               <div className="flex items-end gap-3 rounded-2xl border border-white/10 bg-[#111118] px-4 py-3 transition focus-within:border-red-500/40">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.txt,.jpg,.jpeg,.png,.webp,.gif,.zip"
+                  className="hidden"
+                  onChange={handleFileSelect}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-white/5 text-zinc-300 transition hover:bg-white/10"
+                  aria-label="Attach a file"
+                  title={`Attach a file (max ${Math.round(MAX_ATTACHMENT_SIZE_BYTES / (1024 * 1024))} MB)`}
+                >
+                  <Paperclip size={14} />
+                </button>
                 <textarea
                   ref={inputRef}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder={`Message #${community?.name ?? "general"}`}
+                  placeholder={pendingFile ? "Add a caption (optional)" : `Message #${community?.name ?? "general"}`}
                   rows={1}
                   className="flex-1 resize-none bg-transparent text-sm text-white outline-none placeholder:text-zinc-600"
                   style={{ maxHeight: "140px" }}
@@ -487,7 +926,7 @@ export default function CommunityChatPage() {
                 <button
                   type="button"
                   onClick={() => void handleSend()}
-                  disabled={!input.trim() || sending}
+                  disabled={(input.trim() === "" && !pendingFile) || sending}
                   className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-red-500 text-white transition hover:bg-red-400 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <Send size={15} />
@@ -497,6 +936,14 @@ export default function CommunityChatPage() {
                 Enter to send · Shift+Enter for new line
               </p>
             </div>
+
+            {isTrekkingCommunity && communityId && selectedTrekkingTool ? (
+              <TrekkingToolsPanel
+                communityId={communityId}
+                activeTab={selectedTrekkingTool}
+                onClose={closeCurrentTrekkingTool}
+              />
+            ) : null}
           </div>
 
           {/* Right members panel (desktop always visible, mobile toggle) */}

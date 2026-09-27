@@ -1,12 +1,16 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Send, Hash } from "lucide-react";
+import { Send, Hash, Paperclip, X, Download, Image as ImageIcon } from "lucide-react";
 import useAuth from "@/hooks/useAuth";
 import {
   fetchMessages,
   sendMessage,
+  sendFileMessage,
   subscribeToMessages,
+  validateAttachment,
+  createSignedFileUrl,
+  MAX_ATTACHMENT_SIZE_BYTES,
   type ChatMessage,
 } from "@/lib/chat";
 
@@ -75,9 +79,12 @@ export default function CommunityChat({
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Name cache so realtime messages can show author names ─────────────
   const nameCache = useRef<Map<string, string>>(new Map());
@@ -149,34 +156,97 @@ export default function CommunityChat({
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // ── Send handler ──────────────────────────────────────────────────────
+  const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = event.target.files?.[0];
+    if (!selected) return;
+
+    try {
+      validateAttachment(selected);
+      setPendingFile(selected);
+      setError("");
+    } catch (err: unknown) {
+      setPendingFile(null);
+      setError(err instanceof Error ? err.message : "Unable to attach that file.");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
+
+  useEffect(() => {
+    if (!pendingFile || !pendingFile.type.startsWith("image/")) {
+      setPreviewUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return null;
+      });
+      return;
+    }
+
+    const imageUrl = URL.createObjectURL(pendingFile);
+    setPreviewUrl((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return imageUrl;
+    });
+  }, [pendingFile]);
+
   const handleSend = async () => {
-    const text = input.trim();
-    if (!text || sending) return;
+    if (sending) return;
 
     setSending(true);
     setError("");
-    setInput("");
 
     try {
-      const msg = await sendMessage(communityId, text);
-      // Optimistically add with author name
-      const named: ChatMessage = {
-        ...msg,
-        author_name: String(
-          profile?.full_name ??
-            user?.user_metadata?.full_name ??
-            user?.email?.split("@")[0] ??
-            "You"
-        ),
-      };
-      setMessages((prev) =>
-        prev.some((m) => m.id === named.id) ? prev : [...prev, named]
-      );
+      const text = input.trim();
+      const hasText = text.length > 0;
+
+      if (!hasText && !pendingFile) {
+        setSending(false);
+        return;
+      }
+
+      if (pendingFile) {
+        const msg = await sendFileMessage(communityId, pendingFile);
+        const named: ChatMessage = {
+          ...msg,
+          author_name: String(
+            profile?.full_name ??
+              user?.user_metadata?.full_name ??
+              user?.email?.split("@")[0] ??
+              "You"
+          ),
+        };
+        setMessages((prev) =>
+          prev.some((m) => m.id === named.id) ? prev : [...prev, named]
+        );
+        setPendingFile(null);
+        setInput("");
+      } else {
+        const msg = await sendMessage(communityId, text);
+        const named: ChatMessage = {
+          ...msg,
+          author_name: String(
+            profile?.full_name ??
+              user?.user_metadata?.full_name ??
+              user?.email?.split("@")[0] ??
+              "You"
+          ),
+        };
+        setMessages((prev) =>
+          prev.some((m) => m.id === named.id) ? prev : [...prev, named]
+        );
+        setInput("");
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Failed to send.";
       setError(message);
-      setInput(text); // restore input on failure
+      if (!pendingFile) {
+        setInput(input.trim());
+      }
     } finally {
       setSending(false);
       inputRef.current?.focus();
@@ -190,6 +260,60 @@ export default function CommunityChat({
     }
   };
 
+  const formatFileSize = (bytes: number | null | undefined) => {
+    if (!bytes || bytes <= 0) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex += 1;
+    }
+    return `${value.toFixed(value >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+  };
+
+  const renderFileMessage = async (msg: ChatMessage) => {
+    if (msg.message_type !== "file" || !msg.storage_path) {
+      return null;
+    }
+
+    const downloadUrl = await createSignedFileUrl(msg.storage_path);
+    const isImage = (msg.mime_type ?? "").startsWith("image/");
+
+    return (
+      <div className="mt-2 max-w-md rounded-xl border border-white/10 bg-white/5 p-2">
+        {isImage ? (
+          <img
+            src={downloadUrl}
+            alt={msg.file_name ?? "Attachment"}
+            className="max-h-64 w-full rounded-lg object-cover"
+          />
+        ) : (
+          <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-[#15141b] p-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-red-500/15 text-red-300">
+              <Paperclip size={16} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-white">{msg.file_name ?? "Attachment"}</p>
+              <p className="text-xs text-zinc-400">
+                {(msg.mime_type || "file")}
+                {msg.file_size ? ` · ${formatFileSize(msg.file_size)}` : ""}
+              </p>
+            </div>
+          </div>
+        )}
+        <a
+          href={downloadUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-2 inline-flex items-center gap-2 rounded-lg bg-white/5 px-2.5 py-1.5 text-xs font-medium text-zinc-200 hover:bg-white/10"
+        >
+          <Download size={12} /> Download
+        </a>
+      </div>
+    );
+  };
+
   // ── Group messages by date ────────────────────────────────────────────
   const groups: { date: string; msgs: ChatMessage[] }[] = [];
   for (const msg of messages) {
@@ -200,6 +324,81 @@ export default function CommunityChat({
     } else {
       groups.push({ date: dateStr, msgs: [msg] });
     }
+  }
+
+  function FileMessageCard({
+    message,
+    formatFileSize,
+  }: {
+    message: ChatMessage;
+    formatFileSize: (bytes: number | null | undefined) => string;
+  }) {
+    const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+    const [downloading, setDownloading] = useState(false);
+
+    useEffect(() => {
+      if (!message.storage_path) {
+        setDownloadUrl(null);
+        return;
+      }
+
+      let active = true;
+      setDownloading(true);
+      void createSignedFileUrl(message.storage_path)
+        .then((url) => {
+          if (active) setDownloadUrl(url);
+        })
+        .catch(() => {
+          if (active) setDownloadUrl(null);
+        })
+        .finally(() => {
+          if (active) setDownloading(false);
+        });
+
+      return () => {
+        active = false;
+      };
+    }, [message.storage_path]);
+
+    const isImage = (message.mime_type ?? "").startsWith("image/");
+
+    return (
+      <div className="mt-2 max-w-md rounded-xl border border-white/10 bg-white/5 p-2">
+        {isImage && downloadUrl ? (
+          <img
+            src={downloadUrl}
+            alt={message.file_name ?? "Attachment"}
+            className="max-h-64 w-full rounded-lg object-cover"
+          />
+        ) : null}
+        {!isImage ? (
+          <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-[#15141b] p-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-red-500/15 text-red-300">
+              {isImage ? <ImageIcon size={16} /> : <Paperclip size={16} />}
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium text-white">{message.file_name ?? "Attachment"}</p>
+              <p className="text-xs text-zinc-400">
+                {(message.mime_type || "file")}
+                {message.file_size ? ` · ${formatFileSize(message.file_size)}` : ""}
+              </p>
+            </div>
+          </div>
+        ) : null}
+        <a
+          href={downloadUrl ?? undefined}
+          target="_blank"
+          rel="noreferrer"
+          className={`mt-2 inline-flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs font-medium ${downloadUrl ? "bg-white/5 text-zinc-200 hover:bg-white/10" : "cursor-not-allowed bg-white/5 text-zinc-500"}`}
+          onClick={(e) => {
+            if (!downloadUrl) e.preventDefault();
+          }}
+        >
+          <Download size={12} />
+          {downloading ? "Preparing…" : "Download"}
+        </a>
+      </div>
+    );
   }
 
   return (
@@ -281,9 +480,23 @@ export default function CommunityChat({
                         </div>
                       ) : null}
 
-                      <p className="break-words text-sm leading-relaxed text-zinc-200">
-                        {msg.content}
-                      </p>
+                      {msg.message_type === "file" ? (
+                        <div className="space-y-2">
+                          <p className="break-words text-sm leading-relaxed text-zinc-200">
+                            {msg.content}
+                          </p>
+                          {msg.storage_path ? (
+                            <FileMessageCard
+                              message={msg}
+                              formatFileSize={formatFileSize}
+                            />
+                          ) : null}
+                        </div>
+                      ) : (
+                        <p className="break-words text-sm leading-relaxed text-zinc-200">
+                          {msg.content}
+                        </p>
+                      )}
                     </div>
                   </div>
                 );
@@ -300,13 +513,55 @@ export default function CommunityChat({
           {error ? (
             <p className="mb-2 text-xs text-red-400">{error}</p>
           ) : null}
+          {pendingFile ? (
+            <div className="mb-3 flex items-center justify-between gap-3 rounded-2xl border border-white/10 bg-[#111118] px-3 py-2">
+              <div className="flex min-w-0 items-center gap-3">
+                {previewUrl ? (
+                  <img src={previewUrl} alt="Pending upload preview" className="h-10 w-10 rounded object-cover" />
+                ) : (
+                  <div className="flex h-10 w-10 items-center justify-center rounded bg-white/5 text-zinc-300">
+                    <Paperclip size={15} />
+                  </div>
+                )}
+                <div className="min-w-0">
+                  <p className="truncate text-sm text-white">{pendingFile.name}</p>
+                  <p className="text-xs text-zinc-400">{formatFileSize(pendingFile.size)} · {pendingFile.type || "file"}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPendingFile(null)}
+                className="flex h-8 w-8 items-center justify-center rounded-xl bg-white/5 text-zinc-300 hover:bg-white/10"
+                aria-label="Remove selected file"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ) : null}
+
           <div className="flex items-end gap-3 rounded-2xl border border-white/10 bg-[#111118] px-4 py-3 transition focus-within:border-red-500/40">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.csv,.txt,.jpg,.jpeg,.png,.webp,.gif,.zip"
+              className="hidden"
+              onChange={handleFileSelect}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-white/5 text-zinc-300 transition hover:bg-white/10"
+              aria-label="Attach a file"
+              title={`Attach a file (max ${Math.round(MAX_ATTACHMENT_SIZE_BYTES / (1024 * 1024))} MB)`}
+            >
+              <Paperclip size={14} />
+            </button>
             <textarea
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={`Message #${communityName}`}
+              placeholder={pendingFile ? "Add a caption (optional)" : `Message #${communityName}`}
               rows={1}
               className="flex-1 resize-none bg-transparent text-sm text-white outline-none placeholder:text-zinc-600"
               style={{ maxHeight: "120px" }}
@@ -314,7 +569,7 @@ export default function CommunityChat({
             <button
               type="button"
               onClick={() => void handleSend()}
-              disabled={!input.trim() || sending}
+              disabled={(input.trim() === "" && !pendingFile) || sending}
               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-red-500 text-white transition hover:bg-red-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <Send size={14} />

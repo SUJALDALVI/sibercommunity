@@ -1,6 +1,9 @@
 import { supabase } from "@/lib/supabase/supabase";
 import type { RealtimeChannel } from "@supabase/supabase-js";
 
+export const COMMUNITY_FILES_BUCKET = "community-files";
+export const MAX_ATTACHMENT_SIZE_BYTES = 20 * 1024 * 1024;
+
 export interface ChatMessage {
   id: string;
   community_id: string;
@@ -8,6 +11,13 @@ export interface ChatMessage {
   content: string;
   created_at: string;
   author_name?: string | null;
+  message_type?: "text" | "file" | "poll" | "checklist";
+  file_name?: string | null;
+  file_size?: number | null;
+  mime_type?: string | null;
+  storage_path?: string | null;
+  poll_id?: string | null;
+  checklist_id?: string | null;
 }
 
 // Fetch the last N messages for a community, enriched with profile names
@@ -18,7 +28,9 @@ export async function fetchMessages(
   // Step 1: fetch messages without join (avoids FK issues across schemas)
   const { data: msgs, error } = await supabase
     .from("community_messages")
-    .select("id, community_id, user_id, content, created_at")
+    .select(
+      "id, community_id, user_id, content, created_at, message_type, file_name, file_size, mime_type, storage_path, poll_id, checklist_id"
+    )
     .eq("community_id", communityId)
     .order("created_at", { ascending: true })
     .limit(limit);
@@ -48,6 +60,13 @@ export async function fetchMessages(
     content: row.content,
     created_at: row.created_at,
     author_name: nameMap.get(row.user_id) ?? null,
+    message_type: (row.message_type ?? "text") as ChatMessage["message_type"],
+    file_name: row.file_name ?? null,
+    file_size: row.file_size ?? null,
+    mime_type: row.mime_type ?? null,
+    storage_path: row.storage_path ?? null,
+    poll_id: row.poll_id ?? null,
+    checklist_id: row.checklist_id ?? null,
   }));
 }
 
@@ -67,11 +86,138 @@ export async function sendMessage(
 
   const { data, error } = await supabase
     .from("community_messages")
-    .insert({ community_id: communityId, user_id: user.id, content: trimmed })
-    .select("id, community_id, user_id, content, created_at")
+    .insert({ community_id: communityId, user_id: user.id, content: trimmed, message_type: "text" })
+    .select("id, community_id, user_id, content, created_at, message_type, file_name, file_size, mime_type, storage_path, poll_id, checklist_id")
     .single();
 
   if (error) throw new Error(error.message);
+
+  return { ...data, author_name: null };
+}
+
+export function validateAttachment(file: File): void {
+  const allowedExtensions = new Set([
+    "pdf",
+    "doc",
+    "docx",
+    "ppt",
+    "pptx",
+    "xls",
+    "xlsx",
+    "csv",
+    "txt",
+    "jpg",
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "zip",
+  ]);
+
+  const lowerName = file.name.toLowerCase();
+  const extension = lowerName.includes(".") ? lowerName.split(".").pop() ?? "" : "";
+  const allowedMimeTypes = new Set([
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "text/csv",
+    "text/plain",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+    "application/zip",
+    "application/x-zip-compressed",
+  ]);
+
+  if (file.size > MAX_ATTACHMENT_SIZE_BYTES) {
+    throw new Error("File must be 20 MB or smaller.");
+  }
+
+  const isAllowedByExtension = allowedExtensions.has(extension);
+  const isAllowedByMimeType = allowedMimeTypes.has(file.type || "");
+
+  if (!isAllowedByExtension && !isAllowedByMimeType) {
+    throw new Error("Unsupported file type. Please choose a PDF, document, spreadsheet, text, image, or ZIP file.");
+  }
+}
+
+export async function createSignedFileUrl(storagePath: string, expiresIn = 3600): Promise<string> {
+  const { data, error } = await supabase.storage
+    .from(COMMUNITY_FILES_BUCKET)
+    .createSignedUrl(storagePath, expiresIn);
+
+  if (error || !data?.signedUrl) {
+    throw new Error(error?.message || "Unable to generate a secure download link.");
+  }
+
+  return data.signedUrl;
+}
+
+export async function sendFileMessage(
+  communityId: string,
+  file: File
+): Promise<ChatMessage> {
+  validateAttachment(file);
+
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    throw new Error("You must be logged in to send files.");
+  }
+
+  const { data: member, error: memberError } = await supabase
+    .from("community_members")
+    .select("community_id")
+    .eq("community_id", communityId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (memberError || !member) {
+    throw new Error("You must be a member of this community to share files.");
+  }
+
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const storagePath = `${communityId}/chat/${user.id}/${Date.now()}-${crypto.randomUUID()}-${safeName}`;
+  const safeContent = file.name.trim().length > 0 ? `Shared file: ${file.name}` : "Shared file";
+
+  const uploadResult = await supabase.storage
+    .from(COMMUNITY_FILES_BUCKET)
+    .upload(storagePath, file, {
+      upsert: false,
+      contentType: file.type || "application/octet-stream",
+      cacheControl: "3600",
+    });
+
+  if (uploadResult.error) {
+    throw new Error(uploadResult.error.message || "File upload failed.");
+  }
+
+  const { data, error } = await supabase
+    .from("community_messages")
+    .insert({
+      community_id: communityId,
+      user_id: user.id,
+      content: safeContent,
+      message_type: "file",
+      file_name: file.name,
+      file_size: file.size,
+      mime_type: file.type || "application/octet-stream",
+      storage_path: storagePath,
+    })
+    .select("id, community_id, user_id, content, created_at, message_type, file_name, file_size, mime_type, storage_path, poll_id, checklist_id")
+    .single();
+
+  if (error) {
+    await supabase.storage.from(COMMUNITY_FILES_BUCKET).remove([storagePath]).catch(() => undefined);
+    throw new Error(error.message || "Unable to save the file message.");
+  }
 
   return { ...data, author_name: null };
 }
@@ -92,7 +238,7 @@ export function subscribeToMessages(
         filter: `community_id=eq.${communityId}`,
       },
       (payload) => {
-        const row = payload.new as {
+        const row = payload.new as Partial<ChatMessage> & {
           id: string;
           community_id: string;
           user_id: string;
@@ -105,7 +251,14 @@ export function subscribeToMessages(
           user_id: row.user_id,
           content: row.content,
           created_at: row.created_at,
-          author_name: null, // will be filled in from local state
+          author_name: null,
+          message_type: (row.message_type ?? "text") as ChatMessage["message_type"],
+          file_name: row.file_name ?? null,
+          file_size: row.file_size ?? null,
+          mime_type: row.mime_type ?? null,
+          storage_path: row.storage_path ?? null,
+          poll_id: row.poll_id ?? null,
+          checklist_id: row.checklist_id ?? null,
         });
       }
     )
