@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, Send, Hash, Users, Crown, Shield, Paperclip, X, Download, Image as ImageIcon, ChevronDown, ChevronRight } from "lucide-react";
 import useAuth from "@/hooks/useAuth";
@@ -23,6 +23,7 @@ import LiveKitCallActions from "@/components/calling/LiveKitCallActions";
 import CallButton from "@/components/calling/CallButton";
 import TrekkingToolsPanel from "@/components/community/TrekkingToolsPanel";
 import GymToolsPanel from "@/components/community/GymToolsPanel";
+import { isIDECommunity } from "@/lib/ide/types";
 
 /* ── Types ────────────────────────────────────────────────────── */
 type CommunityInfo = {
@@ -106,7 +107,12 @@ export default function CommunityChatPage() {
   const [selectedTrekkingTool, setSelectedTrekkingTool] = useState<"polls" | "checklist" | "map" | null>(null);
 
   const isGymCommunity = community?.goal === "Gym";
-  const isAdmin = members.find(m => m.user_id === user?.id)?.role === "owner" || members.find(m => m.user_id === user?.id)?.role === "admin";
+  const isIDEEnabled = isIDECommunity(community?.goal);
+  // memoized: avoids two find() calls on every render
+  const isAdmin = useMemo(() => {
+    const role = members.find((m) => m.user_id === user?.id)?.role;
+    return role === "owner" || role === "admin";
+  }, [members, user?.id]);
 
   const closeCurrentTrekkingTool = useCallback(() => {
     setSelectedTrekkingTool(null);
@@ -556,14 +562,17 @@ export default function CommunityChatPage() {
     );
   }
 
-  /* ── Group messages by date ── */
-  const groups: { date: string; msgs: ChatMessage[] }[] = [];
-  for (const msg of messages) {
-    const dateStr = new Date(msg.created_at).toDateString();
-    const last = groups[groups.length - 1];
-    if (last?.date === dateStr) last.msgs.push(msg);
-    else groups.push({ date: dateStr, msgs: [msg] });
-  }
+  /* ── Group messages by date (memoized — only recomputes when messages array changes) ── */
+  const groups = useMemo(() => {
+    const result: { date: string; msgs: ChatMessage[] }[] = [];
+    for (const msg of messages) {
+      const dateStr = new Date(msg.created_at).toDateString();
+      const last = result[result.length - 1];
+      if (last?.date === dateStr) last.msgs.push(msg);
+      else result.push({ date: dateStr, msgs: [msg] });
+    }
+    return result;
+  }, [messages]);
 
   /* ── Loading screen — wait for auth AND data ── */
   if (authLoading || loadingPage) {
@@ -685,6 +694,22 @@ export default function CommunityChatPage() {
                 💪 Gym Tools
               </span>
               {gymToolsOpen ? <ChevronDown size={14} className="text-zinc-400" /> : <ChevronRight size={14} className="text-zinc-400" />}
+            </button>
+          </div>
+        ) : null}
+
+        {/* Cloud IDE link — only for Coding / Application Development communities */}
+        {isIDEEnabled && communityId && isMember ? (
+          <div className="px-4 pb-3">
+            <button
+              type="button"
+              onClick={() => router.push(`/community/${communityId}/ide`)}
+              className="flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left transition hover:bg-white/10"
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-[0.25em] text-zinc-400">
+                💻 Cloud IDE
+              </span>
+              <ChevronRight size={14} className="text-zinc-400" />
             </button>
           </div>
         ) : null}

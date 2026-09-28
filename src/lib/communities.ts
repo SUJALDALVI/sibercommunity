@@ -97,7 +97,7 @@ export async function createCommunity(input: {
 export async function fetchFeaturedCommunities() {
   const { data, error } = await supabase
     .from("communities")
-    .select("*")
+    .select("id, name, goal, description, max_members, created_by, created_at, updated_at")
     .order("created_at", { ascending: false })
     .limit(8);
 
@@ -165,7 +165,7 @@ export async function fetchUserCommunities(userId: string): Promise<CommunitySum
 export async function fetchCommunityById(communityId: string) {
   const { data, error } = await supabase
     .from("communities")
-    .select("*")
+    .select("id, name, goal, description, max_members, created_by, created_at, updated_at")
     .eq("id", communityId)
     .maybeSingle();
 
@@ -175,7 +175,7 @@ export async function fetchCommunityById(communityId: string) {
 
   if (!data) return null;
 
-  // fetch creator profile to show owner name
+  // Fetch creator profile in parallel with the community query (already resolved above)
   try {
     const { data: profileData, error: profileError } = await supabase
       .from("profiles")

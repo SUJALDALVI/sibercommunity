@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Bell, Hash, MessageSquare, X, ArrowRight } from "lucide-react";
 import {
@@ -53,6 +53,7 @@ export default function NotificationsDropdown() {
   const [communityIds, setCommunityIds] = useState<string[]>([]);
 
   const panelRef = useRef<HTMLDivElement>(null);
+  const refetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Load community IDs for realtime ──────────────────────────────────
   useEffect(() => {
@@ -75,17 +76,28 @@ export default function NotificationsDropdown() {
       .finally(() => setLoading(false));
   }, [user?.id]);
 
+  // ── Debounced refetch (prevents N fetches when N messages arrive together) ─
+  const debouncedRefetch = useCallback(() => {
+    if (refetchTimer.current) clearTimeout(refetchTimer.current);
+    refetchTimer.current = setTimeout(() => {
+      void fetchChatNotifications()
+        .then(setNotifications)
+        .catch(() => {});
+    }, 800);
+  }, []);
+
   // ── Realtime badge bump ───────────────────────────────────────────────
   useEffect(() => {
     if (communityIds.length === 0) return;
     const unsub = subscribeToAllCommunityMessages(communityIds, () => {
       setUnreadCount((n) => n + 1);
-      void fetchChatNotifications()
-        .then(setNotifications)
-        .catch(() => {});
+      debouncedRefetch();
     });
-    return unsub;
-  }, [communityIds]);
+    return () => {
+      unsub();
+      if (refetchTimer.current) clearTimeout(refetchTimer.current);
+    };
+  }, [communityIds, debouncedRefetch]);
 
   // ── Close panel on Escape ─────────────────────────────────────────────
   useEffect(() => {
