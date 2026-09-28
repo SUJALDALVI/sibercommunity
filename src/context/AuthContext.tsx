@@ -39,20 +39,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   async function refreshUser() {
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    try {
+      const {
+        data: { user },
+        error,
+      } = await supabase.auth.getUser();
 
-    setUser(user);
+      if (error) {
+        // Network error or token problem — keep existing user state, don't blank the session
+        console.warn("[Auth] getUser failed:", error.message);
+        setLoading(false);
+        return;
+      }
 
-    if (user) {
-      const profile = await getUserProfile();
-      setProfile(profile as UserProfile);
-    } else {
-      setProfile(null);
+      setUser(user);
+
+      if (user) {
+        try {
+          const profile = await getUserProfile();
+          setProfile(profile as UserProfile);
+        } catch (profileErr) {
+          console.warn("[Auth] getUserProfile failed:", profileErr);
+        }
+      } else {
+        setProfile(null);
+      }
+    } catch (err) {
+      // Offline / Failed to fetch — silently skip; loading must still resolve
+      console.warn("[Auth] refreshUser network error:", err);
+    } finally {
+      setLoading(false);
     }
-
-    setLoading(false);
   }
 
   useEffect(() => {

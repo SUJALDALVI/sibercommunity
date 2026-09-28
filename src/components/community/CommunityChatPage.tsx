@@ -22,6 +22,7 @@ import LiveKitCallingProvider from "@/components/calling/LiveKitCallingProvider"
 import LiveKitCallActions from "@/components/calling/LiveKitCallActions";
 import CallButton from "@/components/calling/CallButton";
 import TrekkingToolsPanel from "@/components/community/TrekkingToolsPanel";
+import GymToolsPanel from "@/components/community/GymToolsPanel";
 
 /* ── Types ────────────────────────────────────────────────────── */
 type CommunityInfo = {
@@ -101,7 +102,11 @@ export default function CommunityChatPage() {
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [trekkingToolsOpen, setTrekkingToolsOpen] = useState(false);
+  const [gymToolsOpen, setGymToolsOpen] = useState(false);
   const [selectedTrekkingTool, setSelectedTrekkingTool] = useState<"polls" | "checklist" | "map" | null>(null);
+
+  const isGymCommunity = community?.goal === "Gym";
+  const isAdmin = members.find(m => m.user_id === user?.id)?.role === "owner" || members.find(m => m.user_id === user?.id)?.role === "admin";
 
   const closeCurrentTrekkingTool = useCallback(() => {
     setSelectedTrekkingTool(null);
@@ -668,6 +673,22 @@ export default function CommunityChatPage() {
           </div>
         ) : null}
 
+        {/* Gym Tools button — only for Gym communities */}
+        {isGymCommunity && communityId && isMember ? (
+          <div className="px-4 pb-3">
+            <button
+              type="button"
+              onClick={() => setGymToolsOpen((v) => !v)}
+              className="flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-left"
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-[0.25em] text-zinc-400">
+                💪 Gym Tools
+              </span>
+              {gymToolsOpen ? <ChevronDown size={14} className="text-zinc-400" /> : <ChevronRight size={14} className="text-zinc-400" />}
+            </button>
+          </div>
+        ) : null}
+
         {/* Members in sidebar */}
         <div className="mt-2 flex-1 overflow-y-auto px-4">
           <p className="mb-2 text-xs uppercase tracking-[0.3em] text-zinc-500">
@@ -943,6 +964,17 @@ export default function CommunityChatPage() {
                 activeTab={selectedTrekkingTool}
                 onClose={closeCurrentTrekkingTool}
               />
+            ) : null}
+
+            {/* Gym Tools slide-in panel */}
+            {isGymCommunity && communityId && gymToolsOpen ? (
+              <div className="fixed inset-y-0 right-0 z-50 w-80 overflow-hidden border-l border-white/10 shadow-[-20px_0_60px_rgba(0,0,0,0.6)]">
+                <GymToolsPanel
+                  communityId={communityId}
+                  isAdmin={!!isAdmin}
+                  onClose={() => setGymToolsOpen(false)}
+                />
+              </div>
             ) : null}
           </div>
 

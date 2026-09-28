@@ -74,11 +74,25 @@ type SignalHandler = (msg: SignalMessage) => void;
 export function waitForChannelReady(
   channel: RealtimeChannel,
   label: string,
-  timeoutMs = 10_000
+  timeoutMs = 20_000
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+
     const timer = setTimeout(() => {
-      reject(new Error(`${label}: realtime channel subscription timed out`));
+      if (settled) return;
+      settled = true;
+      // Warn instead of rejecting — a slow/missed subscription should not crash the call flow.
+      // The channel may still become ready after this point.
+      console.warn(`[CALL TRACE] ${label}: realtime channel subscription timed out after ${timeoutMs}ms — continuing anyway`);
+      resolve();
     }, timeoutMs);
 
     channel.subscribe((status) => {
@@ -89,14 +103,14 @@ export function waitForChannelReady(
         subscribed: status === "SUBSCRIBED",
       });
       if (status === "SUBSCRIBED") {
-        clearTimeout(timer);
-        resolve();
+        settle();
         return;
       }
 
       if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-        clearTimeout(timer);
-        reject(new Error(`${label}: realtime channel subscription failed (${status})`));
+        // Don't hard-reject — log and resolve so callers can still attempt to use the channel
+        console.warn(`[CALL TRACE] ${label}: realtime channel status ${status} — resolving anyway`);
+        settle();
       }
     });
   });
