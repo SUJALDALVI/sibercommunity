@@ -19,6 +19,8 @@ import { createHmac, randomBytes } from "crypto";
 import { authenticateRequest, errorResponse } from "@/lib/ide/serverAuth";
 import { getGitHubClientId } from "@/lib/ide/github";
 
+const BASE_URL = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
+
 export async function POST(request: NextRequest) {
   const auth = await authenticateRequest(request);
   if (!auth.ok) return auth.response;
@@ -64,6 +66,7 @@ export async function POST(request: NextRequest) {
   authUrl.searchParams.set("client_id", clientId);
   authUrl.searchParams.set("scope", "repo,read:user");
   authUrl.searchParams.set("state", stateParam);
+  authUrl.searchParams.set("redirect_uri", `${BASE_URL}/api/github/callback`);
 
   return NextResponse.json({ auth_url: authUrl.toString() });
 }
